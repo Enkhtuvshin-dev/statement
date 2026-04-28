@@ -8,6 +8,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
+from matplotlib.colors import LogNorm
+from matplotlib.ticker import FuncFormatter, MaxNLocator
 from scipy.stats import norm
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
@@ -503,8 +505,32 @@ def build_one_account_sender_profile(
             .pivot(index="sender", columns="year_month", values="amount")
             .fillna(0.0)
         )
+        non_zero = heatmap_df[heatmap_df > 0].stack()
+        vmin = float(non_zero.min()) if not non_zero.empty else 1.0
+        vmax = float(non_zero.max()) if not non_zero.empty else 1.0
+        cmap = plt.cm.get_cmap("YlOrRd").copy()
+        cmap.set_bad(color="white")  # masked zeros are rendered as white
+
         plt.figure(figsize=(14, max(4, int(len(heatmap_df) * 0.45))))
-        sns.heatmap(heatmap_df, cmap="YlGnBu", linewidths=0.2, linecolor="white")
+        hm = sns.heatmap(
+            heatmap_df,
+            mask=heatmap_df.eq(0),
+            cmap=cmap,
+            linewidths=0.2,
+            linecolor="white",
+            norm=LogNorm(vmin=max(vmin, 1.0), vmax=max(vmax, 1.0)),
+            cbar_kws={"label": "Monthly inflow amount"},
+        )
+        # Use human-readable colorbar labels (K/M/B) instead of raw ticks.
+        hm.collections[0].colorbar.ax.yaxis.set_major_formatter(
+            FuncFormatter(
+                lambda x, _pos: (
+                    f"{x/1_000_000_000:.1f}B"
+                    if x >= 1_000_000_000
+                    else (f"{x/1_000_000:.1f}M" if x >= 1_000_000 else f"{x/1_000:.0f}K")
+                )
+            )
+        )
         plt.title(f"Monthly Inflow Heatmap by Sender (Top 12) - account_id={account_id}")
         plt.xlabel("Year-Month")
         plt.ylabel("Sender")
@@ -514,23 +540,28 @@ def build_one_account_sender_profile(
         # Small multiples are clearer than one spaghetti line chart.
         top_small = sender_profile.head(8)["sender"].tolist()
         plot_df = monthly[monthly["sender"].isin(top_small)].copy()
+        plot_df["year_month_dt"] = pd.to_datetime(plot_df["year_month"] + "-01", errors="coerce")
         g = sns.relplot(
             data=plot_df,
-            x="year_month",
+            x="year_month_dt",
             y="amount",
             col="sender",
-            col_wrap=4,
+            col_wrap=2,
             kind="line",
             marker="o",
-            height=2.6,
-            aspect=1.35,
+            height=3.0,
+            aspect=1.8,
             facet_kws={"sharex": True, "sharey": True},
         )
         g.set_titles("sender={col_name}")
         for ax in g.axes.flat:
+            ax.xaxis.set_major_locator(MaxNLocator(nbins=6))
+            ax.yaxis.set_major_formatter(FuncFormatter(lambda y, _pos: f"{y/1_000_000:.1f}M"))
             for label in ax.get_xticklabels():
                 label.set_rotation(45)
                 label.set_ha("right")
+            ax.set_xlabel("Year-Month")
+            ax.set_ylabel("Amount (M)")
         g.fig.suptitle(
             f"Monthly Inflow Small Multiples (Top 8 Senders) - account_id={account_id}",
             y=1.03,
