@@ -22,7 +22,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
 
-from step1_inline_income_model import (
+from income_clustering import (
     FEATURE_COLS,
     apply_income_evidence_rules,
     build_features,
