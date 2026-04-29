@@ -24,6 +24,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from step1_inline_income_model import (
     FEATURE_COLS,
+    apply_income_evidence_rules,
     build_features,
     kmeans_confidence,
     map_clusters_to_income,
@@ -59,12 +60,30 @@ def show_df(frame: pd.DataFrame, title: str | None = None, max_rows: int = 20) -
 
 
 def load_raw_data(csv_path: str) -> pd.DataFrame:
-    df = pd.read_csv(csv_path, parse_dates=["transaction_date"])
+    df = pd.read_csv(csv_path)
+    required_cols = {"account_id", "sender", "amount", "transaction_date"}
+    missing = sorted(required_cols.difference(df.columns))
+    if missing:
+        raise ValueError(
+            "Missing required columns in CSV: "
+            + ", ".join(missing)
+            + ". Expected account_id, sender, amount, transaction_date."
+        )
+    transaction_date_text = (
+        df["transaction_date"].astype(str).str.replace(",", " ", regex=False).str.strip()
+    )
+    df["transaction_date"] = pd.to_datetime(transaction_date_text, errors="coerce")
     df = df.dropna(subset=["account_id", "sender", "amount", "transaction_date"]).copy()
     df["account_id"] = df["account_id"].astype(str)
     df["sender"] = df["sender"].astype(str)
-    df["amount"] = pd.to_numeric(df["amount"], errors="coerce")
+    amount_text = df["amount"].astype(str).str.replace(",", "", regex=False).str.strip()
+    df["amount"] = pd.to_numeric(amount_text, errors="coerce")
     df = df.dropna(subset=["amount"]).copy()
+    if df.empty:
+        raise ValueError(
+            "No valid rows remain after parsing amount and transaction_date. "
+            "Check CSV format and values."
+        )
     df["day"] = df["transaction_date"].dt.day
     df["month"] = df["transaction_date"].dt.month
     df["hour"] = df["transaction_date"].dt.hour
@@ -352,7 +371,11 @@ def build_final_model_dataset(df: pd.DataFrame) -> pd.DataFrame:
     clustered = features.copy()
     clustered["cluster_id"] = labels
     clustered["confidence_score"] = kmeans_confidence(distances, labels)
-    clustered["income_type"] = clustered["cluster_id"].map(map_clusters_to_income(clustered))
+    clustered["predicted_income_type"] = clustered["cluster_id"].map(
+        map_clusters_to_income(clustered)
+    )
+    clustered = apply_income_evidence_rules(clustered)
+    clustered["income_type"] = clustered["predicted_income_type"]
 
     sender_income = (
         clustered.sort_values("confidence_score", ascending=False)

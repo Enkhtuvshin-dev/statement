@@ -32,33 +32,43 @@ def in_notebook() -> bool:
         return False
 
 
-def mode_share(day_series: pd.Series) -> float:
-    if day_series.empty:
-        return 0.0
-    counts = day_series.value_counts(dropna=True)
-    if counts.empty:
-        return 0.0
-    return float(counts.iloc[0] / counts.sum())
-
-
 def build_features(transactions: pd.DataFrame) -> pd.DataFrame:
     df = transactions.copy()
-    df["transaction_date"] = pd.to_datetime(df["transaction_date"], errors="coerce")
+    required_cols = {"account_id", "sender", "amount", "transaction_date"}
+    missing = sorted(required_cols.difference(df.columns))
+    if missing:
+        raise ValueError(
+            "Missing required transaction columns: "
+            + ", ".join(missing)
+            + ". Expected columns: account_id, sender, amount, transaction_date."
+        )
+    transaction_date_text = (
+        df["transaction_date"].astype(str).str.replace(",", " ", regex=False).str.strip()
+    )
+    df["transaction_date"] = pd.to_datetime(transaction_date_text, errors="coerce")
+    amount_text = df["amount"].astype(str).str.replace(",", "", regex=False).str.strip()
+    df["amount"] = pd.to_numeric(amount_text, errors="coerce")
     df = df.dropna(subset=["account_id", "sender", "amount", "transaction_date"])
-    df = df.sort_values(["account_id", "sender", "transaction_date"])
+    if df.empty:
+        return pd.DataFrame(
+            columns=[
+                "account_id",
+                "sender",
+                "total_txns",
+                "average_monthly_amount",
+                "active_months",
+                "monthly_amount_std",
+                "average_txns_per_month",
+                "account_total_txn_count",
+                "sender_txn_share_in_account",
+                "monthly_amount_cv",
+            ]
+        )
 
-    df["txn_day"] = df["transaction_date"].dt.floor("D")
     month_source = df["transaction_date"]
     if getattr(month_source.dt, "tz", None) is not None:
         month_source = month_source.dt.tz_localize(None)
     df["month"] = month_source.dt.to_period("M").astype(str)
-    df["day_of_month"] = df["transaction_date"].dt.day
-    df["interval_days"] = (
-        df.groupby(["account_id", "sender"])["transaction_date"]
-        .diff()
-        .dt.total_seconds()
-        .div(86400)
-    )
 
     account_totals = (
         df.groupby("account_id", as_index=False)
@@ -66,62 +76,66 @@ def build_features(transactions: pd.DataFrame) -> pd.DataFrame:
         .astype({"account_total_txn_count": float})
     )
 
-    features = (
-        df.groupby(["account_id", "sender"], as_index=False)
+    monthly_df = (
+        df.groupby(["account_id", "sender", "month"], as_index=False)
         .agg(
-            transaction_count=("amount", "size"),
-            average_amount=("amount", "mean"),
-            amount_std=("amount", "std"),
-            max_amount=("amount", "max"),
-            unique_transaction_days=("txn_day", "nunique"),
-            unique_months=("month", "nunique"),
-            average_interval_days=("interval_days", "mean"),
-            interval_std_days=("interval_days", "std"),
-            median_interval_days=("interval_days", "median"),
-            day_of_month_mode_share=("day_of_month", mode_share),
+            monthly_total_amount=("amount", "sum"),
+            txns_in_month=("amount", "size"),
+        )
+    )
+    medians = monthly_df.groupby(["account_id", "sender"])[
+        "monthly_total_amount"
+    ].transform("median")
+    monthly_df["monthly_total_amount_capped"] = np.where(
+        monthly_df["monthly_total_amount"] > medians * 2,
+        medians,
+        monthly_df["monthly_total_amount"],
+    )
+
+    features = (
+        monthly_df.groupby(["account_id", "sender"], as_index=False)
+        .agg(
+            total_txns=("txns_in_month", "sum"),
+            average_monthly_amount=("monthly_total_amount", "mean"),
+            active_months=("month", "nunique"),
+            monthly_amount_std=("monthly_total_amount_capped", "std"),
+            average_txns_per_month=("txns_in_month", "mean"),
         )
     )
 
     features = features.merge(account_totals, on="account_id", how="left")
     features["sender_txn_share_in_account"] = (
-        features["transaction_count"] / features["account_total_txn_count"].clip(lower=1)
+        features["total_txns"] / features["account_total_txn_count"].clip(lower=1)
     )
-    features["periodicity_30d_score"] = np.exp(
-        -np.abs(features["average_interval_days"] - 30.0) / 10.0
-    ) / (1.0 + features["interval_std_days"].fillna(15.0) / 30.0)
-    features["amount_cv"] = (
-        features["amount_std"].fillna(0)
-        / features["average_amount"].abs().clip(lower=1.0)
-    )
+    features["monthly_amount_cv"] = features["monthly_amount_std"].fillna(
+        0
+    ) / features["average_monthly_amount"].abs().clip(lower=1.0)
 
     return features.fillna(
         {
-            "amount_std": 0.0,
-            "average_interval_days": 0.0,
-            "interval_std_days": 999.0,
-            "median_interval_days": 0.0,
+            "monthly_amount_std": 0.0,
             "sender_txn_share_in_account": 0.0,
-            "periodicity_30d_score": 0.0,
-            "amount_cv": 0.0,
+            "monthly_amount_cv": 0.0,
         }
     )
 
 
 FEATURE_COLS = [
-    "transaction_count",
-    "average_amount",
-    "amount_std",
-    "max_amount",
-    "unique_transaction_days",
-    "unique_months",
-    "average_interval_days",
-    "interval_std_days",
-    "median_interval_days",
-    "day_of_month_mode_share",
+    "total_txns",
+    "average_monthly_amount",
+    "active_months",
+    "average_txns_per_month",
     "sender_txn_share_in_account",
-    "periodicity_30d_score",
-    "amount_cv",
+    "monthly_amount_cv",
 ]
+
+MIN_SALARY_ACTIVE_MONTHS = 2
+MIN_SALARY_TOTAL_TXNS = 2
+SALARY_PROMOTION_MIN_ACTIVE_MONTHS = 4
+SALARY_PROMOTION_CV_MAX = 0.25
+SALARY_PROMOTION_MIN_SCORE = 0.62
+SME_PROTECTION_TXNS_PER_MONTH = 4.0
+SME_PROTECTION_TXN_SHARE = 0.05
 
 
 def kmeans_confidence(distances: np.ndarray, labels: np.ndarray) -> np.ndarray:
@@ -134,26 +148,128 @@ def map_clusters_to_income(out: pd.DataFrame) -> dict[int, str]:
     profile = (
         out.groupby("cluster_id", as_index=False)
         .agg(
-            periodicity_30d_score=("periodicity_30d_score", "mean"),
-            interval_std_days=("interval_std_days", "mean"),
+            monthly_amount_cv=("monthly_amount_cv", "mean"),
+            average_txns_per_month=("average_txns_per_month", "mean"),
+            sender_txn_share_in_account=("sender_txn_share_in_account", "mean"),
+            active_months=("active_months", "mean"),
         )
     )
-    salary_cid = int(
-        profile.sort_values("periodicity_30d_score", ascending=False).iloc[0]["cluster_id"]
+    profile["txns_per_month_distance"] = (
+        profile["average_txns_per_month"] - 2.0
+    ).abs()
+    profile["cv_rank"] = profile["monthly_amount_cv"].rank(method="average", pct=True)
+    profile["dist_rank"] = profile["txns_per_month_distance"].rank(
+        method="average", pct=True
     )
-    other_cid = int(
-        profile.sort_values("interval_std_days", ascending=False).iloc[0]["cluster_id"]
+    profile["txns_rank"] = profile["average_txns_per_month"].rank(
+        method="average", pct=True
     )
+    profile["share_rank"] = profile["sender_txn_share_in_account"].rank(
+        method="average", pct=True
+    )
+    profile["months_rank"] = profile["active_months"].rank(method="average", pct=True)
+    profile["salary_score"] = (
+        (1 - profile["cv_rank"]) * 0.40
+        + (1 - profile["dist_rank"]) * 0.25
+        + profile["share_rank"] * 0.20
+        + profile["months_rank"] * 0.15
+    )
+    profile["sme_score"] = (
+        profile["txns_rank"] * 0.45
+        + profile["share_rank"] * 0.35
+        + profile["months_rank"] * 0.20
+    )
+    salary_cid = int(profile.sort_values("salary_score", ascending=False).iloc[0]["cluster_id"])
+    remaining = profile[profile["cluster_id"] != salary_cid]
+    sme_cid = int(remaining.sort_values("sme_score", ascending=False).iloc[0]["cluster_id"])
 
-    mapping = {}
+    mapping: dict[int, str] = {}
     for cid in profile["cluster_id"].astype(int):
         if cid == salary_cid:
             mapping[cid] = "salary_income"
-        elif cid == other_cid:
-            mapping[cid] = "other_irregular_income"
-        else:
+        elif cid == sme_cid:
             mapping[cid] = "sme_business_income"
+        else:
+            mapping[cid] = "other_irregular_income"
     return mapping
+
+
+def _salary_evidence_features(out: pd.DataFrame) -> pd.DataFrame:
+    out = out.copy()
+    out["salary_txns_per_month_distance"] = (out["average_txns_per_month"] - 2.0).abs()
+    recurrence_score = ((out["active_months"] - 1) / 5.0).clip(lower=0.0, upper=1.0)
+    stability_score = (1.0 - (out["monthly_amount_cv"] / 0.60)).clip(lower=0.0, upper=1.0)
+    schedule_score = (1.0 - (out["salary_txns_per_month_distance"] / 2.0)).clip(
+        lower=0.0, upper=1.0
+    )
+    concentration_score = (out["sender_txn_share_in_account"] / 0.08).clip(
+        lower=0.0, upper=1.0
+    )
+    out["salary_evidence_score"] = (
+        recurrence_score * 0.35
+        + stability_score * 0.30
+        + schedule_score * 0.20
+        + concentration_score * 0.15
+    ).round(4)
+    recurrence_flag = out["active_months"] >= SALARY_PROMOTION_MIN_ACTIVE_MONTHS
+    stability_flag = out["monthly_amount_cv"] <= SALARY_PROMOTION_CV_MAX
+    schedule_flag = out["average_txns_per_month"].between(0.8, 2.5, inclusive="both")
+    concentration_flag = out["sender_txn_share_in_account"] >= 0.01
+    out["salary_evidence_flags"] = (
+        "months="
+        + recurrence_flag.map({True: "1", False: "0"})
+        + "|cv="
+        + stability_flag.map({True: "1", False: "0"})
+        + "|schedule="
+        + schedule_flag.map({True: "1", False: "0"})
+        + "|share="
+        + concentration_flag.map({True: "1", False: "0"})
+    )
+    out["salary_promotion_candidate"] = (
+        recurrence_flag
+        & stability_flag
+        & schedule_flag
+        & (out["salary_evidence_score"] >= SALARY_PROMOTION_MIN_SCORE)
+    )
+    out["sme_protection_flag"] = (
+        (out["average_txns_per_month"] >= SME_PROTECTION_TXNS_PER_MONTH)
+        & (out["sender_txn_share_in_account"] >= SME_PROTECTION_TXN_SHARE)
+        & (out["active_months"] >= 4)
+    )
+    return out
+
+
+def apply_income_evidence_rules(out: pd.DataFrame) -> pd.DataFrame:
+    out = out.copy()
+    out["cluster_income_type"] = out["predicted_income_type"]
+    out["income_label_rule"] = "cluster_model"
+    out = _salary_evidence_features(out)
+    low_recurrence_salary = (
+        out["predicted_income_type"].eq("salary_income")
+        & (
+            (out["active_months"] < MIN_SALARY_ACTIVE_MONTHS)
+            | (out["total_txns"] < MIN_SALARY_TOTAL_TXNS)
+        )
+    )
+    out.loc[low_recurrence_salary, "predicted_income_type"] = "other_irregular_income"
+    out.loc[low_recurrence_salary, "income_label_rule"] = "low_recurrence_override"
+    high_evidence_salary = (
+        ~out["predicted_income_type"].eq("salary_income")
+        & out["salary_promotion_candidate"]
+        & ~out["sme_protection_flag"]
+    )
+    out.loc[high_evidence_salary, "predicted_income_type"] = "salary_income"
+    out.loc[
+        high_evidence_salary, "income_label_rule"
+    ] = "high_recurrence_salary_override"
+    if "confidence_score" in out.columns:
+        out.loc[low_recurrence_salary, "confidence_score"] = out.loc[
+            low_recurrence_salary, "confidence_score"
+        ].clip(upper=0.50)
+        out.loc[high_evidence_salary, "confidence_score"] = out.loc[
+            high_evidence_salary, "confidence_score"
+        ].clip(lower=0.60)
+    return out
 
 
 def show_table(frame: pd.DataFrame) -> None:
@@ -177,6 +293,11 @@ def run_from_dataframe(
 
     sns.set_theme(style="whitegrid")
     features = build_features(transactions)
+    if features.empty:
+        raise ValueError(
+            "No sender features could be built after cleaning input data. "
+            "Check transaction_date/amount formats and null-heavy rows."
+        )
 
     scaler = StandardScaler()
     X = scaler.fit_transform(features[FEATURE_COLS])
@@ -190,6 +311,7 @@ def run_from_dataframe(
     out["confidence_score"] = kmeans_confidence(distances, labels).clip(0, 0.99)
     cluster_map = map_clusters_to_income(out)
     out["predicted_income_type"] = out["cluster_id"].map(cluster_map)
+    out = apply_income_evidence_rules(out)
 
     print("Model Evaluation Metrics:")
     print(f"Rows: {len(out)}")
@@ -205,13 +327,18 @@ def run_from_dataframe(
     sample_cols = [
         "account_id",
         "sender",
+        "cluster_income_type",
         "predicted_income_type",
+        "income_label_rule",
+        "salary_evidence_score",
+        "salary_evidence_flags",
         "confidence_score",
-        "transaction_count",
-        "average_amount",
-        "periodicity_30d_score",
-        "interval_std_days",
-        "amount_cv",
+        "total_txns",
+        "average_monthly_amount",
+        "active_months",
+        "average_txns_per_month",
+        "sender_txn_share_in_account",
+        "monthly_amount_cv",
     ]
     show_table(out[sample_cols].head(limit_rows))
 
@@ -244,16 +371,17 @@ def run_from_dataframe(
     fig3, _ = plt.subplots(figsize=(8, 5))
     sns.scatterplot(
         data=out,
-        x="periodicity_30d_score",
-        y="amount_cv",
+        x="average_txns_per_month",
+        y="monthly_amount_cv",
         hue="predicted_income_type",
-        size="transaction_count",
+        size="total_txns",
         alpha=0.75,
     )
     plt.axhline(y=1.0, color="r", linestyle="--")
-    plt.title("Periodicity vs Amount Variability")
-    plt.xlabel("Periodicity (~30 day score)")
-    plt.ylabel("Amount CV")
+    plt.axvline(x=2.0, color="g", linestyle="--")
+    plt.title("Monthly Frequency vs Amount Variability")
+    plt.xlabel("Average Transactions per Month")
+    plt.ylabel("Monthly Amount CV")
     plt.tight_layout()
     render_plot(fig3, show_plots=show_plots)
 
